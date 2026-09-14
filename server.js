@@ -11,10 +11,20 @@ const wss = new WebSocket.Server({ port: PORT });
 let queue = [];
 // 짝이 된 소켓 -> { opponent: WebSocket, roomId: string }
 const rooms = new Map();
+// 로그인 계정(userId) -> 그 계정으로 지금 매칭 대기중이거나 대전 중인 소켓.
+// 같은 계정이 두 기기에서 동시에 검색/대전하는 걸 막기 위한 것 — 게스트(userId 없음)는
+// 대상이 아니다.
+const activeUsers = new Map();
 
 function send(ws, obj) {
 	if (ws && ws.readyState === WebSocket.OPEN) {
 		ws.send(JSON.stringify(obj));
+	}
+}
+
+function releaseUser(ws) {
+	if (ws.userId != null && activeUsers.get(ws.userId) === ws) {
+		activeUsers.delete(ws.userId);
 	}
 }
 
@@ -48,6 +58,18 @@ wss.on("connection", (ws) => {
 		if (!msg || typeof msg.type !== "string") return;
 
 		if (msg.type === "find_match") {
+			// 로그인 계정으로 온 요청이면, 같은 계정이 이미 다른 소켓(다른 기기)으로
+			// 검색 중이거나 대전 중인지 확인한다 — 있으면 이 요청은 거절하고, 없으면
+			// 이 소켓을 그 계정의 "현재 세션"으로 등록한다.
+			if (typeof msg.user_id === "number" && msg.user_id >= 0) {
+				const existing = activeUsers.get(msg.user_id);
+				if (existing && existing !== ws && existing.readyState === WebSocket.OPEN) {
+					send(ws, { type: "duplicate_session" });
+					return;
+				}
+				ws.userId = msg.user_id;
+				activeUsers.set(msg.user_id, ws);
+			}
 			queue = queue.filter((s) => s !== ws && s.readyState === WebSocket.OPEN);
 			if (queue.length > 0) {
 				const opponent = queue.shift();
@@ -66,11 +88,13 @@ wss.on("connection", (ws) => {
 
 		if (msg.type === "cancel_match") {
 			queue = queue.filter((s) => s !== ws);
+			releaseUser(ws);
 			return;
 		}
 
 		if (msg.type === "leave") {
 			leaveRoom(ws, true);
+			releaseUser(ws);
 			return;
 		}
 
@@ -85,6 +109,7 @@ wss.on("connection", (ws) => {
 	ws.on("close", () => {
 		queue = queue.filter((s) => s !== ws);
 		leaveRoom(ws, true);
+		releaseUser(ws);
 	});
 });
 
